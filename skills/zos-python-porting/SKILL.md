@@ -82,9 +82,14 @@ Check for `.c` files in the project source tree. If present:
 - The compiler variables (CC, CFLAGS, LDFLAGS) are exported as environment variables by `zopen-build` and Python's build system (setuptools, etc.) picks them up automatically.
 - `ZOPEN_MAKE_MINIMAL="yes"` is set for all Python ports — this keeps compiler flags in the environment rather than passing them as make arguments (which would break Python builds).
 - **C extensions compile successfully on z/OS with `-fvisibility=default` flag in `ZOPEN_EXTRA_CFLAGS`.** Modern Python packages often don't need additional symbol visibility patches - the compiler flag is usually sufficient for all extensions to work correctly.
+- **CRITICAL for C extension linking**: Must append `LIBS` to `LDFLAGS` in `zopen_init()` function for proper linking. Example: `export LDFLAGS="$LDFLAGS $LIBS"`. This ensures zoslib and other dependency libraries are linked correctly during Python wheel build.
 
 If no C extensions:
 - `ZOPEN_COMP="skip"` is set (default for Python ports without `--c-extensions`).
+
+### Git Submodules
+
+**For Python ports with git submodules** (e.g., bundled C libraries): Set `ZOPEN_CLONE_SUBMODULES="yes"` in `buildenv` to ensure submodules are cloned during build. Example: python-xxhash bundles xxHash C library as submodule in `deps/xxhash/`.
 
 ### Generate Command
 
@@ -220,7 +225,9 @@ pip install --index-url http://<host>:<port>/pypi/<repo>/simple/ <package>
 2. Modify `zopen_custom_check()` in `buildenv` to use the native test runner instead of pytest
 3. Update `zopen_check_results()` to parse the native test runner's output format
 
+**Python test import shadowing**: When pytest runs from source directory with local package folder (e.g., `xxhash/`), it shadows the installed wheel in site-packages, causing `ModuleNotFoundError` for C extensions. This is expected Python behavior. Tests pass when run from outside source dir or after proper installation. No zopen-build changes needed.
 
+**Python C extensions on z/OS**: After successful wheel build, tests may fail with `ModuleNotFoundError` if the `.so` file isn't in the correct LIBPATH. Need to investigate STEPLIB/LIBPATH settings for pytest to find the compiled extension module.
 
 ### 2. Map Dependencies (Strict)
 
