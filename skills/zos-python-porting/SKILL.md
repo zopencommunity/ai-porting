@@ -1,11 +1,11 @@
 ---
 name: zos-python-porting
-description: Load before starting any z/OS python porting work. Contains required procedures, known gotchas, and build patterns for zopen ports. It provides a command-first workflow for metadata collection, dependency mapping to exact zopen package names, project generation, build/fix iteration, patch creation, bump validation, and optional repo/CI setup.
+description: Load before porting Python packages to z/OS with zopen. Covers pyproject/setup metadata, check_python dependency mapping, C-extension detection, --c-extensions generation, wheel build/check behavior, pytest import shadowing, native test runners, test-result parsing with a >90% success gate, wheel publishing, repository creation, and CI pipeline creation.
 ---
 
-# z/OS Porting
+# z/OS Python Porting
 
-Use this skill for end-to-end zopen porting work with local `zopen-*` commands.
+Use this skill for end-to-end Python package porting work with local `zopen-*` commands.
 
 ## Core Rules
 
@@ -14,6 +14,8 @@ Use this skill for end-to-end zopen porting work with local `zopen-*` commands.
 3. Prefer Homebrew formula metadata and upstream project metadata first; use web search only as fallback.
 4. Do not create files in `patches/` until build succeeds.
 5. **Always run `zopen-build` in foreground with appropriate timeout, never as background process.** This ensures proper error capture and debugging.
+6. After the port builds and validation passes, create the zopencommunity repository and CI/CD job by default. Do not treat repo/CI setup as optional unless the user explicitly says to skip it.
+7. Before finalizing, verify tests are actually processed by `zopen_check_results` and the parsed test success rate is greater than 90%. If no tests are parsed or the success rate is 90% or lower, fix the test flow or get explicit user approval before continuing.
 
 ## CRITICAL: Continuous Skill Improvement
 
@@ -24,10 +26,12 @@ Use this skill for end-to-end zopen porting work with local `zopen-*` commands.
 Run:
 
 ```bash
-command -v zopen-generate zopen-build zopen-info zopen-query zopen-version jq git bump
+command -v zopen-generate zopen-build zopen-info zopen-query zopen-version zopen-create-repo zopen-create-cicd-job jq git bump
 zopen-generate --help
 zopen-build --help
 zopen-info --help
+zopen-create-repo --help
+zopen-create-cicd-job --help
 zopen-version || zopen-version --help
 ```
 
@@ -58,6 +62,19 @@ Use:
 - `zopen-generate --list-build-systems`
 
 ## Python Porting
+
+### Decision Checklist
+
+Before generating the port, determine:
+- package source: `pyproject.toml`, `setup.py`, `setup.cfg`, PyPI metadata, or upstream docs
+- build backend: setuptools, hatchling, poetry-core, meson-python, maturin, or other
+- extension type: pure Python, C extension, Rust extension, or mixed native dependencies
+- source URL type: prefer HTTPS git clone URL; use archive URL only when git is unsuitable
+- submodules: if present, use git URL and set `ZOPEN_CLONE_SUBMODULES="yes"`
+- tests: pytest-compatible, native test runner, generated tests, or no usable upstream tests
+- import behavior: whether tests run from source tree would shadow the installed wheel
+- test gate: newest check log must produce parsed totals and a greater than 90% success rate
+- publish target: pax only, wheel only, or both pax and wheel
 
 ### Metadata Sources (in order)
 
@@ -181,8 +198,10 @@ Also set `ZOPEN_MAKE="zopen_custom_check"` and `ZOPEN_CHECK="zopen_custom_check"
 **CRITICAL: When customizing Python test execution:**
 - Keep pytest invocation verbose (`-v`) to preserve full check log output
 - Ensure `zopen_check_results` parses summary text patterns like `N passed`, `N failed`, and `N errors`
+- Ensure `zopen_check_results` emits nonzero `totalTests` when upstream tests exist
 - Stable log formatting makes CI diagnosis and result extraction reliable
 - Always provide a matching `zopen_check_results` parser for custom check flows so zopen-build records accurate totals
+- Do not continue to finalization, publishing, repo creation, or CI creation unless parsed test success is greater than 90%
 
 ### Publishing
 
@@ -230,6 +249,22 @@ pip install --index-url http://<host>:<port>/pypi/<repo>/simple/ <package>
 1. Check the package documentation or README for test instructions
 2. Modify `zopen_custom_check()` in `buildenv` to use the native test runner instead of pytest
 3. Update `zopen_check_results()` to parse the native test runner's output format
+
+### Test Processing and Success Gate
+
+After every successful `zopen-build`, inspect the newest `*_check.log` and confirm `zopen_check_results` processed the test output.
+
+Required checks:
+1. `zopen_check_results` must emit `actualFailures`, `totalTests`, and `expectedFailures`.
+2. `totalTests` must be greater than zero when the upstream project ships usable tests.
+3. Compute success rate as `(totalTests - actualFailures) * 100 / totalTests`.
+4. Continue only when success rate is greater than 90%.
+5. If success rate is 90% or lower, inspect failures, fix port/test issues, and rerun `zopen-build -v`.
+6. If there are no usable upstream tests, document that fact in `patches/README.md` and get explicit user approval before continuing.
+
+Do not improve the metric by silently deleting, skipping, or narrowing test coverage. Exclude tests only when they are clearly irrelevant, unavailable on z/OS, or require external services; document each exclusion and keep the remaining parsed test set representative.
+
+For custom parsers, count errors as failures. If the runner reports skipped tests separately, do not count skips as failures unless they represent broken required functionality.
 
 **Python test import shadowing**: When pytest runs from source directory with local package folder (e.g., `xxhash/`), it shadows the installed wheel in site-packages, causing `ModuleNotFoundError` for C extensions. This is expected Python behavior. Tests pass when run from outside source dir or after proper installation.
 
@@ -339,6 +374,12 @@ If build fails:
 3. modify source or `buildenv`
 4. rerun `zopen-build -v`
 
+If build succeeds:
+1. inspect the newest `*_check.log`
+2. confirm `zopen_check_results` parsed test totals
+3. verify parsed test success rate is greater than 90%
+4. only then proceed to finalization, publishing, repository creation, and CI/CD creation
+
 #### Handling Patch Conflicts
 
 When patches fail to apply cleanly (common with line ending or format issues on z/OS):
@@ -404,10 +445,12 @@ Common fixes:
 - **posix_memalign missing declaration**: Ensure `#define _XOPEN_SOURCE 600` is at the VERY TOP of the C file, before any includes.
 - **thread_local support**: z/OS Clang may not support `thread_local`. Use thread-specific storage or remove if safe.
 - **poll() conflicts**: `#define __poll 1` in `poll.h` can conflict with variables named `__poll`. `#undef __poll` after including `<poll.h>` on z/OS.
-- Some Python packages (e.g., psutil) check `sys.platform` but lack z/OS support. Patch the pyton script to add z/OS handling similar to existing platforms like AIX. Add `elif sys.platform.startswith('zos'):` cases with appropriate z/OS configuration.
+- Some Python packages (e.g., psutil) check `sys.platform` but lack z/OS support. Patch the Python script to add z/OS handling similar to existing platforms like AIX. Add `elif sys.platform.startswith('zos'):` cases with appropriate z/OS configuration.
 
 
 ### 5. Finalize After Success
+
+Before finalization, the test-processing gate must pass: check results parsed, `totalTests > 0` when upstream tests exist, and success rate greater than 90%.
 
 1. Create patch from extracted source tree:
 ```bash
@@ -439,35 +482,53 @@ echo "<package-name>/" >> .gitignore
 6. **NEVER check in the extracted source directory.** Verify with `git status` before committing.
 7. Document changes in `patches/README.md`.
 
-## Optional Repo/CI
+## Repository and CI/CD
 
-Only for users with required org permissions.
+Create the zopencommunity repository and CI/CD job after the port is validated. This is part of the default completion path for Python ports.
 
-1. Ask user whether to create repo now:
+Only skip this step if the user explicitly says not to create the repository or pipeline. If credentials or org permissions are missing, stop and report the exact command that failed plus the missing access needed.
+
+1. Create the repository:
 ```bash
 zopen-create-repo --help
 zopen-create-repo -n <name> -d "zopen port of <name>"
 ```
 Fallback for token issues: `unset GITHUB_TOKEN; gh repo create zopencommunity/<name>port --public --description "..."`.
 
-2. Push using SSH remote:
+2. Configure the SSH remote and push:
 ```bash
 git remote add origin git@github.com:zopencommunity/<name>port.git
 git push origin main
 ```
 
-3. Ask user whether to create CI job now:
+If `origin` already exists, verify it points to `git@github.com:zopencommunity/<name>port.git` before pushing. Do not overwrite an unrelated remote without asking the user.
+
+3. Create the CI/CD job:
 ```bash
 zopen-create-cicd-job --help
 zopen-create-cicd-job -n <name> -b stable -s cicd-stable.groovy -r yes
 ```
 
+4. Verify the repository and pipeline setup:
+```bash
+git remote -v
+git status --short
+```
+
+The working tree should contain only intentional port files before push. Never push extracted source directories created by `zopen-build`.
+
 ## Completion Criteria
 
 Port is complete when:
 1. `zopen-build` succeeds.
-2. dependencies are exact zopen names.
-3. patches are generated after success.
-4. bump checks pass.
-5. `.gitignore` includes source-dir pattern.
-6. `patches/README.md` is updated.
+2. the newest check log is processed by `zopen_check_results`.
+3. parsed `totalTests` is greater than zero when upstream tests exist.
+4. parsed test success rate is greater than 90%, or the user explicitly approved continuing with documented failures/no usable tests.
+5. dependencies are exact zopen names.
+6. patches are generated after success.
+7. bump checks pass.
+8. `.gitignore` includes source-dir pattern.
+9. `patches/README.md` is updated.
+10. zopencommunity repository exists and `origin` points to it.
+11. port changes are pushed to the repository.
+12. CI/CD job is created for the stable build line.
