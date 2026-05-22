@@ -178,6 +178,12 @@ zopen_check_results() {
 
 Also set `ZOPEN_MAKE="zopen_custom_check"` and `ZOPEN_CHECK="zopen_custom_check"` in buildenv to use custom functions instead of built-ins.
 
+**CRITICAL: When customizing Python test execution:**
+- Keep pytest invocation verbose (`-v`) to preserve full check log output
+- Ensure `zopen_check_results` parses summary text patterns like `N passed`, `N failed`, and `N errors`
+- Stable log formatting makes CI diagnosis and result extraction reliable
+- Always provide a matching `zopen_check_results` parser for custom check flows so zopen-build records accurate totals
+
 ### Publishing
 
 #### GitHub (pax)
@@ -225,9 +231,50 @@ pip install --index-url http://<host>:<port>/pypi/<repo>/simple/ <package>
 2. Modify `zopen_custom_check()` in `buildenv` to use the native test runner instead of pytest
 3. Update `zopen_check_results()` to parse the native test runner's output format
 
-**Python test import shadowing**: When pytest runs from source directory with local package folder (e.g., `xxhash/`), it shadows the installed wheel in site-packages, causing `ModuleNotFoundError` for C extensions. This is expected Python behavior. Tests pass when run from outside source dir or after proper installation. No zopen-build changes needed.
+**Python test import shadowing**: When pytest runs from source directory with local package folder (e.g., `xxhash/`), it shadows the installed wheel in site-packages, causing `ModuleNotFoundError` for C extensions. This is expected Python behavior. Tests pass when run from outside source dir or after proper installation.
 
-**Python C extensions on z/OS**: After successful wheel build, tests may fail with `ModuleNotFoundError` if the `.so` file isn't in the correct LIBPATH. Need to investigate STEPLIB/LIBPATH settings for pytest to find the compiled extension module.
+**CRITICAL: Handling C Extension Test Failures**
+
+For Python C-extension ports, if pytest in zopen-build imports the source tree instead of the installed wheel and fails with `ModuleNotFoundError` for the extension:
+
+1. **Before changing test logic**, inspect the newest `*_check.log` to confirm whether failures come from test execution or import-path shadowing
+2. A pattern like "collected tests" followed by `ModuleNotFoundError` for `package._extension` usually means pytest is running from the source tree and not exercising the installed wheel
+3. **Define `zopen_custom_check`** to:
+   - Install `dist/*.whl` into `.venv` with `pip install --force-reinstall --no-deps`
+   - Copy only the test suite to a temporary directory outside the source tree (e.g., under `/tmp`)
+   - Run pytest from that temporary directory so imports resolve to the installed package
+4. **Provide matching `zopen_check_results`** parser to extract passed/failed/error counts from the pytest summary line
+
+Example for ports with bundled or generated tests:
+```sh
+zopen_custom_check() {
+  . .venv/bin/activate
+  pip install --force-reinstall --no-deps dist/*.whl
+  
+  # Copy tests to temporary directory outside source tree
+  test_dir="/tmp/${ZOPEN_PKGNAME}_tests_$$"
+  mkdir -p "${test_dir}"
+  cp -r tests/* "${test_dir}/"
+  
+  cd "${test_dir}"
+  pytest -v
+  zopen_check_result=$?
+  
+  cd -
+  rm -rf "${test_dir}"
+  deactivate
+  return "${zopen_check_result}"
+}
+```
+
+This approach:
+- Validates the packaged extension exactly as CI/install will use it
+- Ensures the check phase explicitly stages tests into a temporary execution directory
+- Confirms the built wheel contains the extension module
+- Runs tests against the installed wheel from outside the source tree
+- Validates extracted test content separately from the source checkout
+
+**A successful local import test alone is not enough to validate CI**; always confirm the package passes through the zopen-build check phase with the installed wheel plus extracted/copied tests, because pytest collection context can differ from ad hoc manual testing.
 
 ### 2. Map Dependencies (Strict)
 
@@ -272,9 +319,8 @@ zopen-generate \
 Notes:
 - Use `--build-system Go` for Go projects.
 - Keep upstream source URLs (`--stable-url`, `--dev-url`) as `https://` URLs.
-- **Sanitize `buildenv` variables**: Ensure all custom variables use underscores instead of hyphens (e.g., `SQLITE_VEC_VERSION`, not `SQLITE-VEC_VERSION`).
+- **CRITICAL: Sanitize `buildenv` variables**: Shell variables CANNOT contain hyphens. Always use underscores (e.g., `PYTHON_XXHASH_VERSION`, not `PYTHON-XXHASH_VERSION`). Hyphenated names break shell parsing and can surface later as invalid version or loadBuildEnv failures during install/finalization.
 - **For git-based ports**: Specify the HTTPS git URL (e.g., `https://github.com/org/project.git`) rather than a tarball URL unless absolutely necessary. This is appropriate for projects that require git history or submodules.
-- **CRITICAL: Sanitize `buildenv` variables**: Shell variables CANNOT contain hyphens. Always use underscores (e.g., `SQLITE_VEC_VERSION`, not `SQLITE-VEC_VERSION`). This will cause immediate build failures.
 - **For CMake projects**: Always reference existing working examples like `github.com/zopencommunity/llamacppport/blob/main/buildenv` before starting.
 - **Dependency Home Variables**: `zopen-build` automatically provides the root directory of each dependency as an environment variable named `<DEPNAME>_HOME` (e.g., `BLIS_HOME`, `ZOSLIB_HOME`). Reference these in `buildenv` as `\${DEPNAME_HOME}` to ensure they are evaluated correctly during the build process.
 
